@@ -1,343 +1,264 @@
 import time
-import re
-from io import BytesIO
-from urllib.parse import urlparse, urlunparse
-
 import requests
 import streamlit as st
+from io import BytesIO
 from openpyxl import load_workbook
+from urllib.parse import urlparse
 
 # -----------------------
-# DataForSEO endpoints (V3)
-# POST: без /advanced
-# GET: с /advanced/{task_id}
+# Конфигурация API SpeedyIndex
 # -----------------------
-TASK_POST = "/v3/serp/google/organic/task_post"
-TASKS_READY = "/v3/serp/google/organic/tasks_ready"
-TASK_GET_ADV = "/v3/serp/google/organic/task_get/advanced/{task_id}"
+SPEEDY_BASE_URL = "https://api.speedyindex.com/v2"
 
 # -----------------------
-# Helpers
+# Вспомогательные функции (Helpers)
 # -----------------------
-def looks_like_url(v) -> bool:
-    if not isinstance(v, str):
-        return False
-    s = v.strip().lower()
-    return s.startswith("http://") or s.startswith("https://")
+def get_headers(api_key):
+    return {
+        "Authorization": api_key,
+        "Content-Type": "application/json"
+    }
 
-def norm_url(u: str) -> str:
-    """Сравнение URL: без схемы, без www, без query, без trailing slash."""
-    p = urlparse(u.strip())
-    netloc = (p.netloc or "").lower()
-    if netloc.startswith("www."):
-        netloc = netloc[4:]
-    path = (p.path or "").rstrip("/")
-    return urlunparse(("", netloc, path, "", "", "")).lower()
-
-def build_site_query(url: str) -> str:
-    """
-    Запрос для проверки индексации через SERP:
-    https://site.com/path?x=1 -> site:site.com/path
-    главная -> site:site.com
-    """
-    p = urlparse(url.strip())
-    host = (p.netloc or "").lower()
-    if host.startswith("www."):
-        host = host[4:]
-    path = (p.path or "").strip()
-    path = "/" + path.lstrip("/")
-    path = path.rstrip("/")
-    if path in ("", "/"):
-        return f"site:{host}"
-    return f"site:{host}{path}"
-
-def safe_json(resp: requests.Response):
+def get_balance(api_key):
+    """Получаем баланс аккаунта"""
     try:
-        return resp.json()
+        url = f"{SPEEDY_BASE_URL}/account"
+        resp = requests.get(url, headers=get_headers(api_key), timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            # SpeedyIndex возвращает баланс для indexer и checker отдельно
+            # Нам нужен checker
+            checker_bal = data.get("balance", {}).get("checker", 0)
+            return checker_bal
     except Exception:
-        raise RuntimeError(f"Ответ не JSON. HTTP={resp.status_code}. Body(first 500)={resp.text[:500]}")
+        return None
+    return None
 
-def api_request(session: requests.Session, method: str, url: str, *, json_body=None, timeout=60, tries=6):
-    delay = 1.0
-    last_err = None
-    for _ in range(tries):
-        try:
-            if method == "GET":
-                r = session.get(url, timeout=timeout)
-            else:
-                r = session.post(url, json=json_body, timeout=timeout)
+def send_slack_notification(token, channel, message):
+    """Отправка уведомления в Slack"""
+    url = "https://slack.com/api/chat.postMessage"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "channel": channel,
+        "text": message
+    }
+    try:
+        requests.post(url, headers=headers, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Slack error: {e}")
 
-            # 429/5xx — подождём и повторим
-            if r.status_code in (429, 500, 502, 503, 504):
-                last_err = f"HTTP {r.status_code}"
-                time.sleep(delay)
-                delay = min(delay * 2, 20)
-                continue
-
-            return r
-        except Exception as e:
-            last_err = str(e)
-            time.sleep(delay)
-            delay = min(delay * 2, 20)
-
-    raise RuntimeError(f"API request failed after retries: {last_err}")
-
-def find_headers(ws, max_rows=10):
+def find_header_row(ws, max_scan=20):
     """
     Ищем строку заголовков, где:
-    - в колонке B стоит 'Referring Page URL'
-    - в колонке D стоит 'Index'
-    Если не нашли — считаем header_row=1 и принудительно ставим заголовки.
+    - Колонка B (2) содержит 'Referring Page URL'
+    Если не нашли, возвращаем 1
     """
-    for r in range(1, min(ws.max_row or 1, max_rows) + 1):
-        b = ws.cell(row=r, column=2).value
-        d = ws.cell(row=r, column=4).value
-        b_ok = isinstance(b, str) and b.strip().lower() == "referring page url"
-        d_ok = isinstance(d, str) and d.strip().lower() == "index"
-        if b_ok:
-            return r  # достаточно найти B
+    for r in range(1, min(ws.max_row, max_scan) + 1):
+        val = ws.cell(row=r, column=2).value
+        if isinstance(val, str) and "referring page url" in val.lower():
+            return r
     return 1
 
-def collect_tasks_from_workbook(wb):
-    """
-    Возвращает:
-    - tasks_meta: список (sheet_name, row, url)
-    - total_urls
-    И гарантирует, что в каждом листе стоят заголовки в B(header) и D(header).
-    """
-    tasks = []
-    for ws in wb.worksheets:
-        header_row = find_headers(ws)
-
-        # гарантируем заголовки
-        ws.cell(row=header_row, column=2).value = "Referring Page URL"
-        ws.cell(row=header_row, column=4).value = "Index"
-
-        # данные начинаются со следующей строки
-        start_row = header_row + 1
-        max_row = ws.max_row or start_row
-
-        for r in range(start_row, max_row + 1):
-            v = ws.cell(row=r, column=2).value  # колонка B
-            if not looks_like_url(v):
-                continue
-            tasks.append((ws.title, r, v.strip()))
-
-    return tasks, len(tasks)
-
-def match_indexed(original_url: str, items):
-    """indexed=True если нашли URL в organic результатах."""
-    orig = norm_url(original_url)
-    for it in items:
-        if it.get("type") != "organic":
-            continue
-        u = it.get("url")
-        if not u:
-            continue
-        if norm_url(u) == orig:
-            return True
-    return False
+def looks_like_url(val):
+    if not isinstance(val, str):
+        return False
+    s = val.strip().lower()
+    return s.startswith("http://") or s.startswith("https://")
 
 # -----------------------
-# Streamlit UI
+# Основной UI Streamlit
 # -----------------------
-st.set_page_config(page_title="Indexation Checker (DataForSEO)", layout="wide")
-st.title("Проверка индексации ссылок (xlsx → xlsx)")
+st.set_page_config(page_title="SpeedyIndex Checker", layout="wide")
+st.title("Проверка индексации (SpeedyIndex)")
 
-st.caption(
-    "Берём ссылки из колонки B (Referring Page URL) на каждом листе и пишем результат в колонку D (Index)."
-)
-
-uploaded = st.file_uploader("Загрузи .xlsx", type=["xlsx"])
-
-# Настройки запроса (можно оставить дефолт)
-with st.expander("Настройки SERP (опционально)", expanded=False):
-    col1, col2, col3 = st.columns(3)
-    location_code = col1.number_input("location_code", value=2840, min_value=1)  # по умолчанию US
-    language_code = col2.text_input("language_code", value="en")
-    depth = col3.number_input("depth", value=10, min_value=1, max_value=100)
-    device = st.selectbox("device", ["desktop", "mobile"], index=0)
-
-# Secrets
-if "dataforseo" not in st.secrets:
-    st.error("Не найдены secrets: [dataforseo]. Добавь их в Streamlit Cloud → Settings → Secrets.")
+# 1. Проверка Secrets
+if "speedyindex" not in st.secrets or "slack" not in st.secrets:
+    st.error("Не настроены secrets! Добавьте секции [speedyindex] и [slack].")
     st.stop()
 
-dfseo = st.secrets["dataforseo"]
-login = dfseo.get("login")
-password = dfseo.get("password")
-host = (dfseo.get("host") or "api.dataforseo.com").replace("https://", "").replace("http://", "").strip().strip("/")
+api_key = st.secrets["speedyindex"]["api_key"]
+slack_token = st.secrets["slack"]["bot_token"]
+slack_channel = st.secrets["slack"]["channel_id"]
 
-if not login or not password:
-    st.error("В secrets нет dataforseo.login или dataforseo.password")
-    st.stop()
+# 2. Отображение баланса
+balance = get_balance(api_key)
+if balance is not None:
+    st.success(f"💰 Баланс SpeedyIndex (Checker): **{balance}** проверок")
+else:
+    st.warning("Не удалось получить баланс. Проверьте API ключ.")
 
-base_url = f"https://{host}"
+st.markdown("---")
 
-run = st.button("Старт проверки", disabled=(uploaded is None))
+# 3. Загрузка файла
+uploaded_file = st.file_uploader("Загрузите файл .xlsx", type=["xlsx"])
 
-if not run:
-    st.stop()
+if uploaded_file:
+    # Читаем файл в память
+    wb = load_workbook(BytesIO(uploaded_file.getvalue()))
+    all_sheet_names = wb.sheetnames
+    
+    selected_sheets = []
 
-# -----------------------
-# Processing
-# -----------------------
-status_box = st.status("Подготовка...", expanded=True)
-progress = st.progress(0.0)
-stats = st.empty()
+    # ЛОГИКА ВЫБОРА ЛИСТОВ
+    if len(all_sheet_names) > 1:
+        st.info(f"В файле найдено {len(all_sheet_names)} листов.")
+        selected_sheets = st.multiselect(
+            "Выберите листы для обработки:", 
+            options=all_sheet_names,
+            default=all_sheet_names
+        )
+    else:
+        # Если лист один - выбираем его автоматически без вопросов
+        selected_sheets = all_sheet_names
 
-wb = load_workbook(BytesIO(uploaded.getvalue()))
-tasks_meta, total = collect_tasks_from_workbook(wb)
-
-if total == 0:
-    status_box.update(label="В файле не найдено ни одной ссылки в колонке B", state="error")
-    st.stop()
-
-status_box.write(f"Найдено ссылок: **{total}** (все листы вместе).")
-status_box.write("Этап 1/3: постановка задач (task_post)…")
-
-session = requests.Session()
-session.auth = (login, password)
-session.headers.update({"Content-Type": "application/json"})
-
-# task_id -> (sheet_name, row, url)
-pending = {}
-pending_ids = set()
-
-BATCH_SIZE = 100
-posted = 0
-done = 0
-errors = 0
-
-def update_ui(stage_text: str, current_sheet: str | None = None):
-    pct = done / total if total else 0.0
-    progress.progress(min(pct, 1.0))
-    sheet_text = f" | лист: `{current_sheet}`" if current_sheet else ""
-    stats.markdown(
-        f"**Этап:** {stage_text}{sheet_text}\n\n"
-        f"**Готово:** {done}/{total}  \n"
-        f"**Ошибок:** {errors}"
-    )
-
-# 1) POST batches
-for i in range(0, total, BATCH_SIZE):
-    batch_meta = tasks_meta[i:i + BATCH_SIZE]
-    payload = []
-    for (sheet_name, row, url) in batch_meta:
-        payload.append({
-            "keyword": build_site_query(url),
-            "location_code": int(location_code),
-            "language_code": str(language_code),
-            "device": str(device),
-            "depth": int(depth),
-            "tag": f"{sheet_name}__{row}",
-        })
-
-    r = api_request(session, "POST", base_url + TASK_POST, json_body=payload, timeout=60)
-    data = safe_json(r)
-
-    if data.get("status_code") != 20000:
-        # если упали на POST — сразу показываем и выходим
-        status_box.update(label=f"Ошибка task_post: {data.get('status_code')} {data.get('status_message')}", state="error")
-        st.code(data)
+    if not selected_sheets:
+        st.warning("Выберите хотя бы один лист для продолжения.")
         st.stop()
 
-    # Важно: задачи в ответе идут в том же порядке, что payload
-    api_tasks = data.get("tasks") or []
-    for idx, t in enumerate(api_tasks):
-        tid = t.get("id")
-        if not tid:
-            continue
-        sheet_name, row, url = batch_meta[idx]
-        pending[tid] = (sheet_name, row, url)
-        pending_ids.add(tid)
+    if st.button("🚀 Начать проверку"):
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        total_sheets = len(selected_sheets)
+        sheets_processed = 0
+        total_links_checked = 0
+        
+        # Для уведомления в слак
+        slack_report = []
 
-    posted += len(batch_meta)
-    update_ui("Постановка задач (task_post)", batch_meta[-1][0])
+        # Создаем сессию requests для переиспользования соединений
+        session = requests.Session()
+        session.headers.update(get_headers(api_key))
 
-status_box.write("Этап 2/3: ожидание готовности и получение результатов (tasks_ready + task_get)…")
+        for sheet_name in selected_sheets:
+            status_text.write(f"⏳ Обработка листа: **{sheet_name}**...")
+            ws = wb[sheet_name]
+            
+            # 1. Находим заголовки и данные
+            header_row = find_header_row(ws)
+            # Принудительно ставим заголовки для ясности результата
+            ws.cell(row=header_row, column=4).value = "Index" # Column D
+            
+            urls_map = {} # { normalized_url : [list of row_indices] }
+            raw_urls = [] # list for API
+            
+            # Собираем URL
+            start_row = header_row + 1
+            for r in range(start_row, ws.max_row + 1):
+                cell_val = ws.cell(row=r, column=2).value
+                if looks_like_url(cell_val):
+                    clean_url = cell_val.strip()
+                    raw_urls.append(clean_url)
+                    
+                    if clean_url not in urls_map:
+                        urls_map[clean_url] = []
+                    urls_map[clean_url].append(r)
 
-# 2) Poll ready + GET results
-last_poll = 0.0
-POLL_EVERY = 3.0
+            if not raw_urls:
+                status_text.write(f"⚠️ На листе {sheet_name} не найдено ссылок.")
+                continue
 
-while pending_ids:
-    now = time.time()
-    if now - last_poll < POLL_EVERY:
-        time.sleep(0.5)
-        continue
-    last_poll = now
+            # 2. Создаем задачу в SpeedyIndex
+            # API принимает до 10k ссылок, мы отправляем весь лист сразу
+            create_payload = {
+                "title": f"Streamlit check {sheet_name}",
+                "urls": raw_urls
+            }
+            
+            try:
+                # POST create task
+                r_create = session.post(
+                    f"{SPEEDY_BASE_URL}/task/google/checker/create", 
+                    json=create_payload
+                )
+                res_create = r_create.json()
+                
+                if res_create.get("code") != 0:
+                    st.error(f"Ошибка создания задачи для листа {sheet_name}: {res_create}")
+                    continue
+                
+                task_id = res_create.get("task_id")
+                status_text.write(f"Task ID: {task_id}. Ожидание результатов...")
 
-    update_ui("Получение результатов (tasks_ready/task_get)")
+                # 3. Полллинг статуса (ждем пока is_completed = true)
+                is_completed = False
+                attempts = 0
+                while not is_completed and attempts < 60: # макс 3-4 минуты ожидания
+                    time.sleep(3) # ждем 3 сек
+                    
+                    r_status = session.post(
+                        f"{SPEEDY_BASE_URL}/task/google/checker/status", 
+                        json={"task_ids": [task_id]}
+                    )
+                    res_status = r_status.json()
+                    
+                    task_info = res_status.get("result", [])[0]
+                    if task_info.get("is_completed"):
+                        is_completed = True
+                    else:
+                        attempts += 1
+                        status_text.write(f"Лист {sheet_name}: Обработано {task_info.get('processed_count', 0)} из {task_info.get('size', 0)}...")
 
-    r = api_request(session, "GET", base_url + TASKS_READY, timeout=60)
-    data = safe_json(r)
-    if data.get("status_code") != 20000:
-        errors += 1
-        continue
+                if not is_completed:
+                    st.error(f"Таймаут проверки листа {sheet_name}")
+                    continue
 
-    ready = set()
-    for t in data.get("tasks") or []:
-        for res in (t.get("result") or []):
-            rid = res.get("id")
-            if rid:
-                ready.add(rid)
+                # 4. Получаем отчет (Report)
+                r_report = session.post(
+                    f"{SPEEDY_BASE_URL}/task/google/checker/report", 
+                    json={"task_id": task_id}
+                )
+                data_report = r_report.json()
+                
+                # Списки ссылок из ответа
+                indexed_list = set(data_report.get("result", {}).get("indexed_links", []))
+                # Unindexed нам не обязателен для проверки "in", но он есть в data_report
+                
+                # 5. Записываем результаты в Excel
+                # Проходим по всем URL, которые мы отправляли
+                for url, rows in urls_map.items():
+                    # Проверяем, есть ли url в списке проиндексированных
+                    # SpeedyIndex может немного нормализовать ссылки, но обычно возвращает как есть
+                    is_indexed = url in indexed_list
+                    
+                    for r_idx in rows:
+                        ws.cell(row=r_idx, column=4).value = is_indexed
+                
+                count_indexed = len(indexed_list)
+                count_total = len(raw_urls)
+                slack_report.append(f"• List *{sheet_name}*: {count_indexed}/{count_total} indexed")
+                total_links_checked += count_total
+                
+            except Exception as e:
+                st.error(f"Критическая ошибка на листе {sheet_name}: {e}")
 
-    # берём только те, что относятся к нашему запуску
-    to_process = list(pending_ids.intersection(ready))
-    if not to_process:
-        continue
+            sheets_processed += 1
+            progress_bar.progress(sheets_processed / total_sheets)
 
-    # Чтобы не застрелиться по лимитам — обрабатываем порциями
-    to_process = to_process[:50]
+        # -----------------------
+        # Финализация
+        # -----------------------
+        status_text.success("✅ Проверка завершена!")
+        
+        # Сохранение файла
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+        
+        st.download_button(
+            label="📥 Скачать результат (.xlsx)",
+            data=output,
+            file_name="checked_results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
-    for tid in to_process:
-        sheet_name, row, url = pending[tid]
-        ws = wb[sheet_name]
-
-        try:
-            rr = api_request(session, "GET", base_url + TASK_GET_ADV.format(task_id=tid), timeout=120)
-            res = safe_json(rr)
-
-            if res.get("status_code") != 20000:
-                ws.cell(row=row, column=4).value = "ERROR"
-                errors += 1
-            else:
-                task = (res.get("tasks") or [{}])[0]
-                if task.get("status_code") != 20000:
-                    ws.cell(row=row, column=4).value = "ERROR"
-                    errors += 1
-                else:
-                    result = (task.get("result") or [{}])[0]
-                    items = result.get("items") or []
-                    indexed = match_indexed(url, items)
-                    # пишем в колонку D (Index)
-                    ws.cell(row=row, column=4).value = bool(indexed)
-
-            done += 1
-            update_ui("Получение результатов (tasks_ready/task_get)", sheet_name)
-
-        except Exception:
-            ws.cell(row=row, column=4).value = "ERROR"
-            done += 1
-            errors += 1
-            update_ui("Получение результатов (tasks_ready/task_get)", sheet_name)
-
-        pending_ids.remove(tid)
-
-status_box.write("Этап 3/3: формирование файла…")
-
-# Save workbook to bytes
-out = BytesIO()
-wb.save(out)
-out.seek(0)
-
-status_box.update(label="Готово ✅", state="complete")
-update_ui("Готово")
-
-st.download_button(
-    "Скачать результат (.xlsx)",
-    data=out.getvalue(),
-    file_name="indexation_checked.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
+        # Отправка в Slack
+        if slack_report:
+            msg_header = f"🤖 *Indexation Check Complete*\nTotal checked: {total_links_checked}\n\nDetails:\n"
+            full_msg = msg_header + "\n".join(slack_report)
+            send_slack_notification(slack_token, slack_channel, full_msg)
+            st.toast("Уведомление отправлено в Slack", icon="📨")
